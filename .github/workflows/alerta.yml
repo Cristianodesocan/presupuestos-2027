@@ -1,0 +1,85 @@
+# Vigilancia periódica de la página de Presupuestos CAC 2027.
+#
+# Cadencia: mismo criterio que transparencia-gobcan. GitHub da la prioridad más
+# baja a los trabajos programados y descarta muchos en hora punta, sobre todo
+# los que caen en :00 y :30. Se pide cada hora en minutos no redondos, con dos
+# intentos en la primera hora del día por si se descarta uno.
+#
+# NOTA: el cron va en UTC. Canarias está en UTC+0 desde el 25 de octubre de 2026
+# hasta el 28 de marzo de 2027, así que las horas de abajo coinciden con la hora
+# canaria durante todo el periodo previsible (proyecto en otoño, ley en diciembre).
+# Si se mantiene después de marzo, restar una hora a cada expresión.
+
+name: Alerta Presupuestos CAC 2027
+
+on:
+  schedule:
+    - cron: "17,47 8 * * 1-5"  # 8:17 y 8:47 hora canaria
+    - cron: "17 9-19 * * 1-5"  # cada hora, hasta las 19:17
+    - cron: "7 21 * * *"       # cierre diario a las 21:07, también fines de semana
+  workflow_dispatch:
+    inputs:
+      simular:
+        description: "Simulación (no abre issue, no envía correo, no guarda estado)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # commitear estado.json
+  issues: write   # abrir el issue de aviso
+  actions: write  # mantener vivo el workflow (ver último paso)
+
+concurrency:
+  # Dos ejecuciones solapadas podrían avisar dos veces o pisarse el commit.
+  group: alerta-presupuestos
+  cancel-in-progress: false
+
+jobs:
+  comprobar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      # En una ejecución programada `inputs` no existe: `inputs.simular` es null
+      # y las expresiones de abajo lo tratan como falso, que es lo que queremos.
+      - name: Comprobar la página de presupuestos
+        id: alerta
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_USUARIO: ${{ secrets.SMTP_USUARIO }}
+          SMTP_CONTRASENA: ${{ secrets.SMTP_CONTRASENA }}
+          ALERTAS_REMITENTE: ${{ secrets.SMTP_USUARIO }}
+          ALERTAS_DESTINATARIAS: ${{ vars.ALERTAS_DESTINATARIAS }}
+        run: python alerta_presupuestos.py ${{ inputs.simular && '--simular' || '' }}
+
+      - name: Guardar estado
+        if: ${{ steps.alerta.outcome == 'success' && !inputs.simular }}
+        run: |
+          if [[ -n "$(git status --porcelain estado.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add estado.json
+            git commit -m "Actualiza estado (${{ steps.alerta.outputs.hitos || 'documentos' }})"
+            git push
+          fi
+
+      # GitHub desactiva los cron de repos públicos tras 60 días sin actividad,
+      # y el repo solo se commitea cuando cambia la página: entre el proyecto
+      # (octubre) y la ley (finales de diciembre) puede pasar ese plazo. Volver
+      # a habilitar el workflow por la API reinicia el contador sin commits.
+      - name: Mantener vivo el workflow
+        if: ${{ always() && github.event.schedule == '7 21 * * *' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/alerta.yml/enable"
